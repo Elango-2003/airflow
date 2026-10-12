@@ -112,3 +112,102 @@ Run ``python -m pdb <path to Dag file>.py`` for an interactive debugging experie
       dag.test()
 
 2. Run / debug the Dag file.
+
+
+Debugging Dags in a deployed environment
+========================================
+
+``dag.test()`` and ``pdb`` are useful while you write a Dag, but most problems show up later, in a shared
+deployment, with real Connections, real data and a schedule. The techniques below help you find out why a task
+failed there and confirm a fix without re-running the whole Dag.
+
+Start from the failed task instance
+-----------------------------------
+
+In the :ref:`Grid view <ui-grid-view>`, click the failed task cell to open the
+:ref:`Task Instance view <ui-ti-view>`. Its :ref:`tabs <ui-ti-tabs>` answer most first questions:
+
+* **Logs** shows the output and traceback of the attempt. If the task was retried, select the attempt you are
+  interested in, because the first failure is often more informative than the last one.
+* **Rendered Templates** shows the templated fields after Jinja rendering. Check it when a task received the wrong
+  date, path, SQL or parameter: the problem is often in the template, not in the operator.
+* **XCom** shows what the task pushed or returned. Open it on the *upstream* task as well, to confirm that the
+  failing task received the input you expected.
+* **Details** shows the Dag version and bundle the task ran with, and **Code** shows the Dag source at that version.
+  Use them to rule out "the fix was deployed, but this run used the old code".
+
+Inspect a task instance from the command line
+---------------------------------------------
+
+The same information is available from the CLI, which is convenient on a worker or in a script. Each command takes
+the Dag ID, the task ID and the logical date or run ID of the Dag run:
+
+.. code-block:: bash
+
+  # Current state of the task instance
+  airflow tasks state my_dag my_task manual__2026-01-01T00:00:00+00:00
+
+  # Why the scheduler does not queue it (unmet dependencies, pool, concurrency limits, ...)
+  airflow tasks failed-deps my_dag my_task manual__2026-01-01T00:00:00+00:00
+
+  # Templated fields as they render for that run
+  airflow tasks render my_dag my_task manual__2026-01-01T00:00:00+00:00
+
+``failed-deps`` is the quickest way to debug a task that stays in the ``scheduled`` or ``queued`` state instead
+of failing. For mapped tasks, pass ``--map-index``.
+
+If a Dag is missing from the UI or has stopped updating, check whether its file fails to import:
+
+.. code-block:: bash
+
+  airflow dags list-import-errors
+
+Check Connections and Variables
+-------------------------------
+
+Many "works locally, fails in production" errors come from Connections or Variables that are missing or differ
+between environments. Check what the deployment actually has:
+
+.. code-block:: bash
+
+  airflow connections get my_conn_id
+  airflow variables get my_variable
+
+If your deployment enables connection testing (``[core] test_connection = Enabled``; it is disabled by default),
+``airflow connections test my_conn_id`` also checks that the connection can reach its service. See
+:doc:`/howto/connection` and :doc:`/howto/variable` for how Connections and Variables are resolved.
+
+Re-run a single task
+--------------------
+
+``airflow tasks test`` runs one task instance in the current process, without checking its dependencies and
+without recording its state in the database. Use it on a machine that has the same configuration, Connections and
+packages as your workers to reproduce a failure:
+
+.. code-block:: bash
+
+  airflow tasks test my_dag my_task manual__2026-01-01T00:00:00+00:00
+
+Useful options:
+
+* ``-t`` / ``--task-params`` passes a JSON dict of params to the task.
+* ``-m`` / ``--post-mortem`` opens a debugger when the task raises an uncaught exception.
+* ``--map-index`` selects one instance of a mapped task.
+
+.. warning::
+
+  ``airflow tasks test`` really executes the task. If the task writes to a database, calls an API or deletes
+  files, those side effects happen. Point it at test data or a non-production Connection where you can.
+
+Once you have a fix, re-run the task inside the deployment by **clearing** it, so the scheduler runs it again and
+records the result. In the UI, select the task instance and use **Clear**, optionally including downstream tasks.
+From the CLI:
+
+.. code-block:: bash
+
+  # Clear only failed instances of the matching tasks, and everything downstream of them
+  airflow tasks clear my_dag -t "^my_task$" -s 2026-01-01 -e 2026-01-01 --only-failed --downstream
+
+If a task cannot succeed for a reason outside the Dag (for example, data that will be delivered later by another
+process), you can instead **mark** it as successful or failed in the UI so that downstream tasks can continue. Use
+this deliberately: marking a task successful does not run it.
